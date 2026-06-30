@@ -1,0 +1,116 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cocoindex-code"
+dynamic = ["version"]
+description = "MCP server for indexing and querying codebases using CocoIndex"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+keywords = ["mcp", "codebase", "indexing", "vector-search", "cocoindex"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+dependencies = [
+    "mcp>=1.0.0",
+    "cocoindex[litellm]>=1.0.13,<1.1.0",
+    "sqlite-vec>=0.1.0",
+    "pydantic>=2.0.0",
+    "numpy>=1.24.0",
+    "einops>=0.8.2",
+    "typer>=0.9.0",
+    "msgspec>=0.19.0",
+    "pathspec>=0.12.1",
+    "pyyaml>=6.0",
+    "questionary>=2.0.0",
+]
+
+[project.optional-dependencies]
+# `embeddings-local` is the primary feature extra: it pulls in
+# `sentence-transformers` (via cocoindex) so local embeddings work without
+# an API key.
+embeddings-local = ["cocoindex[sentence-transformers]>=1.0.13,<1.1.0"]
+# `full` is the umbrella "batteries-included" alias. Today it's just
+# `embeddings-local`, but we expect to bundle more optional niceties under
+# it over time — users who want everything can keep using `[full]` and pick
+# up the additions automatically. The name also matches the Docker
+# `:full` image variant for consistency across install paths. Contents are
+# inlined rather than self-referencing `cocoindex-code[embeddings-local]`
+# to avoid resolver edge cases with older pip.
+full = ["cocoindex[sentence-transformers]>=1.0.13,<1.1.0"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "prek>=0.1.0",
+    "cocoindex[sentence-transformers]>=1.0.13,<1.1.0",
+]
+
+[project.scripts]
+cocoindex-code = "cocoindex_code:main"
+ccc = "cocoindex_code.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/cocoindex-io/cocoindex-code"
+Repository = "https://github.com/cocoindex-io/cocoindex-code"
+Issues = "https://github.com/cocoindex-io/cocoindex-code/issues"
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "999.0.0"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/cocoindex_code/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cocoindex_code"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/README.md", "/LICENSE"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "prek>=0.1.0",
+    "types-pyyaml>=6.0.12.20250915",
+    "cocoindex[sentence-transformers]>=1.0.13,<1.1.0",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+explicit_package_bases = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short -m 'not docker_e2e'"
+asyncio_mode = "auto"
+markers = [
+    "docker_e2e: requires Docker; builds the image and runs containerized E2E tests. Run with: pytest -m docker_e2e",
+]

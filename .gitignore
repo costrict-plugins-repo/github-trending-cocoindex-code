@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude Code local config and state
+/.claude/
+
+# Testing
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+
+# Generated version file
+src/cocoindex_code/_version.py
+
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+
+# Docker E2E fixtures contain a `lib/` dir that the generic Python rule above
+# would ignore — keep it tracked.
+!tests/e2e_docker_fixtures/**
