@@ -1,0 +1,384 @@
+"""MCP server for codebase indexing and querying.
+
+Supports two modes:
+1. Daemon-backed: ``create_mcp_server(client, project_root)`` — lightweight MCP
+   server that delegates to the daemon via per-request client functions.
+2. Legacy entry point: ``main()`` — backward-compatible ``cocoindex-code`` CLI that
+   auto-creates settings from env vars and delegates to the daemon.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+from pathlib import Path
+
+from mcp.server.mcpserver import MCPServer
+from pydantic import BaseModel, Field
+
+from ._version import __version__
+from .settings import DaemonSettings, load_user_settings
+
+_MCP_INSTRUCTIONS = (
+    "Code search and codebase understanding tools."
+    "\n"
+    "Use when you need to find code, understand how something works,"
+    " locate implementations, or explore an unfamiliar codebase."
+    "\n"
+    "Provides semantic search that understands meaning --"
+    " unlike grep or text matching,"
+    " it finds relevant code even when exact keywords are unknown."
+)
+
+
+# === Pydantic Models for Tool Inputs/Outputs ===
+
+
+class CodeChunkResult(BaseModel):
+    """A single code chunk result."""
+
+    file_path: str = Field(description="Relative path to the file")
+    language: str = Field(description="Programming language")
+    content: str = Field(description="The code content")
+    start_line: int = Field(description="Starting line number (1-indexed)")
+    end_line: int = Field(description="Ending line number (1-indexed)")
+    score: float = Field(description="Similarity score (0-1, higher is better)")
+
+
+class SearchResultModel(BaseModel):
+    """Result from search tool."""
+
+    success: bool
+    results: list[CodeChunkResult] = Field(default_factory=list)
+    total_returned: int = Field(default=0)
+    offset: int = Field(default=0)
+    message: str | None = None
+
+
+# === Daemon-backed MCP server factory ===
+
+
+def create_mcp_server(project_root: str) -> MCPServer:
+    """Create a lightweight MCP server that delegates to the daemon."""
+    mcp = MCPServer("cocoindex-code", instructions=_MCP_INSTRUCTIONS, version=__version__)
+
+    @mcp.tool(
+        name="search",
+        description=(
+            "Semantic code search across the entire codebase"
+            " -- finds code by meaning, not just text matching."
+            " Use this instead of grep/glob when you need to find implementations,"
+            " understand how features work,"
+            " or locate related code without knowing exact names or keywords."
+            " Accepts natural language queries"
+            " (e.g., 'authentication logic', 'database connection handling')"
+            " or code snippets."
+            " Returns matching code chunks with file paths,"
+            " line numbers, and relevance scores."
+            " Start with a small limit (e.g., 5);"
+            " if most results look relevant, use offset to paginate for more."
+        ),
+    )
+    async def search(
+        query: str = Field(
+            description=(
+                "Natural language query or code snippet to search for."
+                " Examples: 'error handling middleware',"
+                " 'how are users authenticated',"
+                " 'database connection pool',"
+                " or paste a code snippet to find similar code."
+            )
+        ),
+        limit: int = Field(
+            default=5,
+            ge=1,
+            le=100,
+            description="Maximum number of results to return (1-100)",
+        ),
+        offset: int = Field(
+            default=0,
+            ge=0,
+            description="Number of results to skip for pagination",
+        ),
+        refresh_index: bool = Field(
+            default=True,
+            description=(
+                "Whether to incrementally update the index before searching."
+                " Set to False for faster consecutive queries"
+                " when the codebase hasn't changed."
+            ),
+        ),
+        languages: list[str] | None = Field(
+            default=None,
+            description="Filter by programming language(s). Example: ['python', 'typescript']",
+        ),
+        paths: list[str] | None = Field(
+            default=None,
+            description=(
+                "Filter by file path pattern(s) using GLOB wildcards (* and ?)."
+                " Example: ['src/utils/*', '*.py']"
+            ),
+        ),
+    ) -> SearchResultModel:
+        """Query the codebase index via the daemon."""
+        from . import client as _client
+
+        loop = asyncio.get_event_loop()
+        try:
+            if refresh_index:
+                await loop.run_in_executor(None, lambda: _client.index(project_root))
+            resp = await loop.run_in_executor(
+                None,
+                lambda: _client.search(
+                    project_root=project_root,
+                    query=query,
+                    languages=languages,
+                    paths=paths,
+                    limit=limit,
+                    offset=offset,
+                ),
+            )
+            return SearchResultModel(
+                success=resp.success,
+                results=[
+                    CodeChunkResult(
+                        file_path=r.file_path,
+                        language=r.language,
+                        content=r.content,
+                        start_line=r.start_line,
+                        end_line=r.end_line,
+                        score=r.score,
+                    )
+                    for r in resp.results
+                ],
+                total_returned=resp.total_returned,
+                offset=resp.offset,
+                message=resp.message,
+            )
+        except Exception as e:
+            return SearchResultModel(success=False, message=f"Query failed: {e!s}")
+
+    return mcp
+
+
+# === Daemon heartbeat loop ===
+
+
+def heartbeat_interval_s(idle_timeout_minutes: int) -> int:
+    """Heartbeat period for a given idle timeout: a third of the timeout,
+    clamped to [30 s, 300 s] so several heartbeats always fit in one idle
+    window without hammering the daemon on very long timeouts.
+    """
+    return max(30, min(300, idle_timeout_minutes * 60 // 3))
+
+
+async def run_heartbeat_loop() -> None:
+    """Periodically heartbeat the daemon so it never idle-exits under this
+    live MCP session when ``daemon.keep_alive_with_mcp`` is enabled. When the
+    option is disabled, the daemon may idle-exit and the next real request
+    restarts it transparently. When this process dies (even SIGKILL), the
+    heartbeats stop and the daemon exits on its normal idle timeout.
+
+    Reads the timeout from the same ``global_settings.yml`` the daemon reads
+    (dataclass default when the file is missing or invalid). Returns
+    immediately when the timeout is 0 (daemon never idle-exits) or MCP
+    keep-alive is disabled. The heartbeat itself never starts or restarts a
+    daemon — see ``client.send_heartbeat``.
+    """
+    try:
+        daemon_settings = load_user_settings().daemon
+    except (FileNotFoundError, ValueError):
+        daemon_settings = DaemonSettings()
+    timeout_minutes = daemon_settings.idle_timeout_minutes
+    if timeout_minutes <= 0 or not daemon_settings.keep_alive_with_mcp:
+        return
+
+    from .client import send_heartbeat
+
+    interval = heartbeat_interval_s(timeout_minutes)
+    loop = asyncio.get_event_loop()
+    while True:
+        await asyncio.sleep(interval)
+        # Client I/O is blocking — run off the event loop thread.
+        await loop.run_in_executor(None, send_heartbeat)
+
+
+# Keep the old `mcp` global for backward compatibility in __init__.py
+mcp: MCPServer | None = None
+
+
+# === Backward-compatible entry point ===
+
+
+def _convert_embedding_model(env_model: str) -> tuple[str, str]:
+    """Convert old COCOINDEX_CODE_EMBEDDING_MODEL to (provider, model)."""
+    sbert_prefix = "sbert/"
+    if env_model.startswith(sbert_prefix):
+        return "sentence-transformers", env_model[len(sbert_prefix) :]
+    return "litellm", env_model
+
+
+def main() -> None:
+    """Backward-compatible entry point for ``cocoindex-code`` CLI.
+
+    Auto-detects/creates settings from env vars, then delegates to daemon.
+    """
+    import argparse
+
+    from .settings import (
+        EmbeddingSettings,
+        LanguageOverride,
+        default_project_settings,
+        default_user_settings,
+        find_legacy_project_root,
+        find_project_root,
+        project_settings_path,
+        save_project_settings,
+        save_user_settings,
+        user_settings_path,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog="cocoindex-code",
+        description="MCP server for codebase indexing and querying.",
+    )
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("serve", help="Run the MCP server (default)")
+    subparsers.add_parser("index", help="Build/refresh the index and report stats")
+    args = parser.parse_args()
+
+    # --- Discover project root ---
+    cwd = Path.cwd()
+    project_root = find_project_root(cwd)
+
+    if project_root is None:
+        # Try env var
+        env_root = os.environ.get("COCOINDEX_CODE_ROOT_PATH")
+        if env_root:
+            project_root = Path(env_root).resolve()
+        else:
+            # Use marker-based discovery
+            legacy_root = find_legacy_project_root(cwd)
+            project_root = legacy_root if legacy_root is not None else cwd
+
+    # --- Auto-create project settings if needed ---
+    proj_settings_file = project_settings_path(project_root)
+    if not proj_settings_file.is_file():
+        ps = default_project_settings()
+
+        # Migrate COCOINDEX_CODE_EXCLUDED_PATTERNS
+        raw_excluded = os.environ.get("COCOINDEX_CODE_EXCLUDED_PATTERNS", "").strip()
+        if raw_excluded:
+            try:
+                extra_excluded = json.loads(raw_excluded)
+                if isinstance(extra_excluded, list):
+                    ps.exclude_patterns.extend(
+                        p.strip() for p in extra_excluded if isinstance(p, str) and p.strip()
+                    )
+            except json.JSONDecodeError:
+                pass
+
+        # Migrate COCOINDEX_CODE_EXTRA_EXTENSIONS
+        raw_extra = os.environ.get("COCOINDEX_CODE_EXTRA_EXTENSIONS", "")
+        for token in raw_extra.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if ":" in token:
+                ext, lang = token.split(":", 1)
+                ext = ext.strip()
+                lang = lang.strip()
+                ps.include_patterns.append(f"**/*.{ext}")
+                if lang:
+                    ps.language_overrides.append(LanguageOverride(ext=ext, lang=lang))
+            else:
+                ps.include_patterns.append(f"**/*.{token}")
+
+        save_project_settings(project_root, ps)
+
+    # --- Auto-create user settings if needed ---
+    user_file = user_settings_path()
+    if not user_file.is_file():
+        us = default_user_settings()
+
+        # Migrate COCOINDEX_CODE_EMBEDDING_MODEL
+        env_model = os.environ.get("COCOINDEX_CODE_EMBEDDING_MODEL", "")
+        if env_model:
+            provider, model = _convert_embedding_model(env_model)
+            us.embedding = EmbeddingSettings(provider=provider, model=model)
+
+        # Migrate COCOINDEX_CODE_DEVICE
+        env_device = os.environ.get("COCOINDEX_CODE_DEVICE")
+        if env_device:
+            us.embedding.device = env_device
+
+        save_user_settings(us)
+
+    # --- Delegate to daemon ---
+    from . import client as _client
+    from .protocol import IndexingProgress
+
+    if args.command == "index":
+        import sys
+
+        from rich.console import Console
+        from rich.live import Live
+        from rich.spinner import Spinner
+
+        from .cli import _format_progress
+
+        err_console = Console(stderr=True)
+        last_progress_line: str | None = None
+
+        with Live(Spinner("dots", "Indexing..."), console=err_console, transient=True) as live:
+
+            def _on_waiting() -> None:
+                live.update(
+                    Spinner(
+                        "dots",
+                        "Another indexing is ongoing, waiting for it to finish...",
+                    )
+                )
+
+            def _on_progress(progress: IndexingProgress) -> None:
+                nonlocal last_progress_line
+                last_progress_line = f"Indexing: {_format_progress(progress)}"
+                live.update(Spinner("dots", last_progress_line))
+
+            resp = _client.index(
+                str(project_root), on_progress=_on_progress, on_waiting=_on_waiting
+            )
+
+        if last_progress_line is not None:
+            print(last_progress_line, file=sys.stderr)
+
+        if resp.success:
+            st = _client.project_status(str(project_root))
+            print("\nIndex stats:")
+            print(f"  Chunks: {st.total_chunks}")
+            print(f"  Files:  {st.total_files}")
+            if st.languages:
+                print("  Languages:")
+                for lang, count in sorted(st.languages.items(), key=lambda x: -x[1]):
+                    print(f"    {lang}: {count} chunks")
+        else:
+            print(f"Indexing failed: {resp.message}")
+    else:
+        # Default: run MCP server
+        mcp_server = create_mcp_server(str(project_root))
+
+        async def _serve() -> None:
+            from .cli import _bg_index
+
+            background_tasks = {
+                asyncio.create_task(_bg_index(str(project_root))),
+                asyncio.create_task(run_heartbeat_loop()),
+            }
+            try:
+                await mcp_server.run_stdio_async()
+            finally:
+                for task in background_tasks:
+                    task.cancel()
+
+        asyncio.run(_serve())
