@@ -1,0 +1,175 @@
+"""Tests for the pluggable chunker registry.
+
+Uses Project.create() directly with a stub embedder so no real embedding model
+is needed.  Each test writes files to a temp directory, indexes them, and
+queries the resulting SQLite database to verify chunk content and language.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Any
+
+from cocoindex.connectors import sqlite as coco_sqlite
+from conftest import StubEmbedder
+from example_toml_chunker import toml_chunker
+
+from cocoindex_code.chunking import (
+    CHUNKER_REGISTRY,
+    Chunk,
+    ChunkerFn,
+    LoadedChunker,
+    TextPosition,
+)
+from cocoindex_code.project import Project
+from cocoindex_code.settings import ProjectSettings
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+async def _index_project(
+    project_root: Path,
+    embedder: StubEmbedder,
+    chunker_registry: dict[str, ChunkerFn] | None = None,
+) -> Project:
+    """Create a Project and run a full index pass.
+
+    These tests index once, so the spec and module hash only have to exist.
+    """
+    settings = ProjectSettings(include_patterns=["**/*.*"], exclude_patterns=["**/.cocoindex_code"])
+    from cocoindex_code.settings import save_project_settings
+
+    save_project_settings(project_root, settings)
+    project = await Project.create(
+        project_root,
+        embedder,
+        indexing_params={},
+        query_params={},
+        chunker_registry={
+            suffix: LoadedChunker(fn, spec=fn.__qualname__, module_sha256="")
+            for suffix, fn in (chunker_registry or {}).items()
+        },
+    )
+    await project.run_index()
+    return project
+
+
+def _query_chunks(project_root: Path) -> list[dict[str, Any]]:
+    """Read all stored chunks from the target SQLite database."""
+    db_path = project_root / ".cocoindex_code" / "target_sqlite.db"
+    conn = coco_sqlite.connect(str(db_path), load_vec=True)
+    try:
+        with conn.readonly() as db:
+            db.row_factory = sqlite3.Row
+            rows = db.execute(
+                "SELECT file_path, language, content, start_line, end_line FROM code_chunks_vec"
+            ).fetchall()
+            return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _pos(line: int) -> TextPosition:
+    """TextPosition with only line number set; suitable for line-granularity chunkers."""
+    return TextPosition(byte_offset=0, char_offset=0, line=line, column=0)
+
+
+# ---------------------------------------------------------------------------
+# TOML fixture content
+# ---------------------------------------------------------------------------
+
+_TOML_CONTENT = """\
+[section_one]
+key = "value"
+answer = 42
+
+[section_two]
+other = "hello"
+flag = true
+"""
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+async def test_default_registry_is_empty(tmp_path: Path, stub_embedder: StubEmbedder) -> None:
+    """CHUNKER_REGISTRY is an empty dict when no registry is passed."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "hello.py").write_text("x = 1\n")
+
+    project = await _index_project(tmp_path, stub_embedder)
+    registry = project.env.get_context(CHUNKER_REGISTRY)
+    assert isinstance(registry, dict)
+    assert registry == {}
+
+
+async def test_unregistered_suffix_uses_splitter(
+    tmp_path: Path, stub_embedder: StubEmbedder
+) -> None:
+    """Files with no registered chunker are processed by RecursiveSplitter."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "sample.py").write_text("def foo():\n    return 1\n")
+
+    await _index_project(tmp_path, stub_embedder)
+    chunks = _query_chunks(tmp_path)
+
+    assert len(chunks) >= 1
+    assert all(c["language"] == "python" for c in chunks)
+    assert any("foo" in c["content"] for c in chunks)
+
+
+async def test_registered_chunker_is_called(tmp_path: Path, stub_embedder: StubEmbedder) -> None:
+    """A registered ChunkerFn splits files and may override the language."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "config.toml").write_text(_TOML_CONTENT)
+
+    await _index_project(tmp_path, stub_embedder, chunker_registry={".toml": toml_chunker})
+    chunks = _query_chunks(tmp_path)
+
+    assert len(chunks) == 2
+    contents = {c["content"] for c in chunks}
+    assert any("section_one" in c for c in contents)
+    assert any("section_two" in c for c in contents)
+    assert all(c["language"] == "toml" for c in chunks)
+
+
+async def test_chunker_language_none_preserves_detected(
+    tmp_path: Path, stub_embedder: StubEmbedder
+) -> None:
+    """When ChunkerFn returns language=None, detect_code_language() is used."""
+
+    def _passthrough_chunker(path: Path, content: str) -> tuple[str | None, list[Chunk]]:
+        lines = content.splitlines()
+        return None, [Chunk(text=content, start=_pos(1), end=_pos(len(lines)))]
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "script.py").write_text("x = 1\n")
+
+    await _index_project(tmp_path, stub_embedder, chunker_registry={".py": _passthrough_chunker})
+    chunks = _query_chunks(tmp_path)
+
+    assert all(c["language"] == "python" for c in chunks)
+
+
+async def test_registry_does_not_affect_other_suffixes(
+    tmp_path: Path, stub_embedder: StubEmbedder
+) -> None:
+    """Registering a chunker for .toml does not affect .py files."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / "config.toml").write_text(_TOML_CONTENT)
+    (tmp_path / "code.py").write_text("def bar():\n    pass\n")
+
+    await _index_project(tmp_path, stub_embedder, chunker_registry={".toml": toml_chunker})
+    chunks = _query_chunks(tmp_path)
+
+    toml_chunks = [c for c in chunks if c["language"] == "toml"]
+    py_chunks = [c for c in chunks if c["language"] == "python"]
+
+    assert len(toml_chunks) == 2
+    assert len(py_chunks) >= 1
+    assert any("bar" in c["content"] for c in py_chunks)

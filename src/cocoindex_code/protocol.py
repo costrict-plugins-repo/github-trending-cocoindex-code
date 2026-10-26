@@ -1,0 +1,264 @@
+"""IPC message types and serialization helpers for daemon communication."""
+
+from __future__ import annotations
+
+import msgspec as _msgspec
+
+# ---------------------------------------------------------------------------
+# Requests (tagged union via struct tag)
+# ---------------------------------------------------------------------------
+
+
+class HandshakeRequest(_msgspec.Struct, tag="handshake"):
+    version: str
+
+
+class IndexRequest(_msgspec.Struct, tag="index"):
+    project_root: str
+
+
+class SearchRequest(_msgspec.Struct, tag="search"):
+    project_root: str
+    query: str
+    languages: list[str] | None = None
+    paths: list[str] | None = None
+    limit: int = 5
+    offset: int = 0
+
+
+class ProjectStatusRequest(_msgspec.Struct, tag="project_status"):
+    project_root: str
+
+
+class DaemonStatusRequest(_msgspec.Struct, tag="daemon_status"):
+    pass
+
+
+class RemoveProjectRequest(_msgspec.Struct, tag="remove_project"):
+    project_root: str
+
+
+class StopRequest(_msgspec.Struct, tag="stop"):
+    pass
+
+
+class DoctorRequest(_msgspec.Struct, tag="doctor"):
+    project_root: str | None = None
+
+
+class DaemonEnvRequest(_msgspec.Struct, tag="daemon_env"):
+    pass
+
+
+class HeartbeatRequest(_msgspec.Struct, tag="heartbeat"):
+    """Counts as client activity for the daemon's idle timeout.
+
+    Sent periodically by long-lived MCP servers so the daemon does not
+    idle-exit under an active session.
+    """
+
+    pass
+
+
+Request = (
+    HandshakeRequest
+    | IndexRequest
+    | SearchRequest
+    | ProjectStatusRequest
+    | DaemonStatusRequest
+    | RemoveProjectRequest
+    | StopRequest
+    | DoctorRequest
+    | DaemonEnvRequest
+    | HeartbeatRequest
+)
+
+# ---------------------------------------------------------------------------
+# Responses
+# ---------------------------------------------------------------------------
+
+
+class HandshakeResponse(_msgspec.Struct, tag="handshake"):
+    # The handshake is the one message exchanged between *mismatched*
+    # client/daemon versions — it is how a mismatch gets detected in the
+    # first place. Every field added after a release MUST have a default:
+    # a required field makes an older daemon's reply undecodable, which
+    # breaks the restart-on-mismatch path and bricks every command
+    # (issue #237).
+    ok: bool
+    daemon_version: str
+    # The daemon's process id. The client remembers it so that, when the
+    # daemon later vanishes, the graceful-exit marker (written on shutdown
+    # with the same pid) can be matched race-free against the exact process
+    # the client was talking to — distinguishing a graceful exit from a crash.
+    # None only when decoding the reply of a pre-0.2.38 daemon, whose
+    # handshake never satisfies ``ok`` and version checks anyway.
+    pid: int | None = None
+    global_settings_mtime_us: int | None = None
+    # Non-fatal daemon-side warnings surfaced to the client on every handshake.
+    # The client dedupes and prints them to stderr (see client._print_handshake_warnings).
+    warnings: list[str] = []
+
+
+class IndexResponse(_msgspec.Struct, tag="index"):
+    success: bool
+    message: str | None = None
+
+
+class IndexingProgress(_msgspec.Struct):
+    """Indexing stats snapshot, shared between progress updates and status responses."""
+
+    num_execution_starts: int
+    num_unchanged: int
+    num_adds: int
+    num_deletes: int
+    num_reprocesses: int
+    num_errors: int
+
+
+class IndexProgressUpdate(_msgspec.Struct, tag="index_progress"):
+    """Streamed during indexing — one per stats change, before the final IndexResponse."""
+
+    progress: IndexingProgress
+
+
+class IndexWaitingNotice(_msgspec.Struct, tag="index_waiting"):
+    """Sent when another indexing is already in progress and the client must wait."""
+
+    pass
+
+
+class SearchResult(_msgspec.Struct):
+    file_path: str
+    language: str
+    content: str
+    start_line: int
+    end_line: int
+    score: float
+
+
+class SearchResponse(_msgspec.Struct, tag="search"):
+    success: bool
+    results: list[SearchResult] = []
+    total_returned: int = 0
+    offset: int = 0
+    message: str | None = None
+
+
+class ProjectStatusResponse(_msgspec.Struct, tag="project_status"):
+    indexing: bool
+    total_chunks: int
+    total_files: int
+    languages: dict[str, int]
+    progress: IndexingProgress | None = None
+    index_exists: bool = True
+
+
+class DaemonProjectInfo(_msgspec.Struct):
+    project_root: str
+    indexing: bool
+
+
+class DaemonStatusResponse(_msgspec.Struct, tag="daemon_status"):
+    version: str
+    uptime_seconds: float
+    projects: list[DaemonProjectInfo]
+    # Idle-timeout observability: seconds since the last client activity and
+    # the configured timeout (0 = never exit).
+    idle_seconds: float
+    idle_timeout_minutes: int
+
+
+class RemoveProjectResponse(_msgspec.Struct, tag="remove_project"):
+    ok: bool
+
+
+class StopResponse(_msgspec.Struct, tag="stop"):
+    ok: bool
+
+
+class HeartbeatResponse(_msgspec.Struct, tag="heartbeat"):
+    ok: bool
+
+
+class DoctorCheckResult(_msgspec.Struct):
+    name: str
+    ok: bool
+    details: list[str]
+    errors: list[str]
+    # Full formatted traceback for a failed check, shown by `ccc doctor` to aid
+    # debugging of daemon-side exceptions (e.g. a failing model check).
+    traceback: str | None = None
+
+
+class DoctorResponse(_msgspec.Struct, tag="doctor"):
+    result: DoctorCheckResult
+    final: bool = False
+
+
+class DbPathMappingEntry(_msgspec.Struct):
+    source: str
+    target: str
+
+
+class DaemonEnvResponse(_msgspec.Struct, tag="daemon_env"):
+    env_names: list[str]
+    settings_env_names: list[str]
+    db_path_mappings: list[DbPathMappingEntry] = []
+    host_path_mappings: list[DbPathMappingEntry] = []
+
+
+class ErrorResponse(_msgspec.Struct, tag="error"):
+    message: str
+    # Full formatted traceback from the daemon, when the error originates from an
+    # unhandled exception. Surfaced by the CLI so daemon-side failures are debuggable.
+    traceback: str | None = None
+
+
+Response = (
+    HandshakeResponse
+    | IndexResponse
+    | IndexProgressUpdate
+    | IndexWaitingNotice
+    | SearchResponse
+    | ProjectStatusResponse
+    | DaemonStatusResponse
+    | RemoveProjectResponse
+    | StopResponse
+    | HeartbeatResponse
+    | DoctorResponse
+    | DaemonEnvResponse
+    | ErrorResponse
+)
+
+IndexStreamResponse = IndexProgressUpdate | IndexWaitingNotice | IndexResponse | ErrorResponse
+SearchStreamResponse = IndexWaitingNotice | SearchResponse | ErrorResponse
+DoctorStreamResponse = DoctorResponse | ErrorResponse
+
+# ---------------------------------------------------------------------------
+# Encode / decode helpers (msgpack binary)
+# ---------------------------------------------------------------------------
+
+_request_encoder = _msgspec.msgpack.Encoder()
+_request_decoder = _msgspec.msgpack.Decoder(Request)
+
+_response_encoder = _msgspec.msgpack.Encoder()
+_response_decoder = _msgspec.msgpack.Decoder(Response)
+
+
+def encode_request(req: Request) -> bytes:
+    return _request_encoder.encode(req)
+
+
+def decode_request(data: bytes) -> Request:
+    result: Request = _request_decoder.decode(data)
+    return result
+
+
+def encode_response(resp: Response) -> bytes:
+    return _response_encoder.encode(resp)
+
+
+def decode_response(data: bytes) -> Response:
+    result: Response = _response_decoder.decode(data)
+    return result

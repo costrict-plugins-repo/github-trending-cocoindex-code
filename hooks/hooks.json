@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 60,
+            "command": "root=\"${CLAUDE_PROJECT_DIR:-${GROK_WORKSPACE_ROOT:-}}\"; [ -z \"$root\" ] && root=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; command -v ccc >/dev/null && test -f \"$root/.cocoindex_code/settings.yml\" && [ \"$(cd \"$root/.cocoindex_code\" && pwd -P)\" != \"$(cd \"${COCOINDEX_CODE_DIR:-$HOME/.cocoindex_code}\" 2>/dev/null && pwd -P)\" ] && (cd \"$root\" && ccc index) 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|search_replace",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 30,
+            "command": "root=\"${CLAUDE_PROJECT_DIR:-${GROK_WORKSPACE_ROOT:-}}\"; [ -z \"$root\" ] && root=\"$(git rev-parse --show-toplevel 2>/dev/null || pwd)\"; command -v ccc >/dev/null && test -f \"$root/.cocoindex_code/settings.yml\" && [ \"$(cd \"$root/.cocoindex_code\" && pwd -P)\" != \"$(cd \"${COCOINDEX_CODE_DIR:-$HOME/.cocoindex_code}\" 2>/dev/null && pwd -P)\" ] && (cd \"$root\" && ccc index) 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

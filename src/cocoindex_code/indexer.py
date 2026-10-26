@@ -1,0 +1,133 @@
+"""CocoIndex app for indexing codebases."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from pathlib import Path
+
+import cocoindex as coco
+from cocoindex.connectors import localfs, sqlite
+from cocoindex.connectors.sqlite import Vec0TableDef
+from cocoindex.ops.text import RecursiveSplitter, detect_code_language
+from cocoindex.resources.chunk import Chunk
+from cocoindex.resources.id import IdGenerator
+
+from .chunking import CHUNKER_REGISTRY
+from .file_walk import build_matcher
+from .settings import load_project_settings
+from .shared import (
+    CODEBASE_DIR,
+    EMBEDDER,
+    INDEXING_EMBED_PARAMS,
+    SQLITE_DB,
+    CodeChunk,
+)
+
+# Chunking configuration
+CHUNK_SIZE = 1000
+MIN_CHUNK_SIZE = 250
+CHUNK_OVERLAP = 150
+
+# Chunking splitter (stateless, can be module-level)
+splitter = RecursiveSplitter()
+
+
+@coco.fn(memo=True)
+async def process_file(
+    file: localfs.File,
+    table: sqlite.TableTarget[CodeChunk],
+    language_overrides: Mapping[str, str],
+) -> None:
+    """Process a single file: chunk, embed, and store.
+
+    ``language_overrides`` maps a file suffix (``".inc"``) to a language. It is an
+    argument rather than read from settings here so that it is part of the memo key.
+    """
+    embedder = coco.use_context(EMBEDDER)
+    indexing_params = coco.use_context(INDEXING_EMBED_PARAMS)
+
+    try:
+        content = await file.read_text()
+    except UnicodeDecodeError:
+        return
+
+    if not content.strip():
+        return
+
+    suffix = file.file_path.path.suffix
+    language = (
+        language_overrides.get(suffix)
+        or detect_code_language(filename=file.file_path.path.name)
+        or "text"
+    )
+
+    chunker_registry = coco.use_context(CHUNKER_REGISTRY)
+    chunker = chunker_registry.get(suffix)
+    if chunker is not None:
+        language_override, chunks = chunker.fn(Path(file.file_path.path), content)
+        if language_override is not None:
+            language = language_override
+    else:
+        chunks = splitter.split(
+            content,
+            chunk_size=CHUNK_SIZE,
+            min_chunk_size=MIN_CHUNK_SIZE,
+            chunk_overlap=CHUNK_OVERLAP,
+            language=language,
+        )
+
+    id_gen = IdGenerator()
+
+    async def process(chunk: Chunk) -> None:
+        table.declare_row(
+            row=CodeChunk(
+                id=await id_gen.next_id(chunk.text),
+                file_path=file.file_path.path.as_posix(),
+                language=language,
+                content=chunk.text,
+                start_line=chunk.start.line,
+                end_line=chunk.end.line,
+                embedding=await embedder.embed(chunk.text, **indexing_params),
+            )
+        )
+
+    await coco.map(process, chunks)
+
+
+@coco.fn
+async def indexer_main() -> None:
+    """Main indexing function - walks files and processes each."""
+    project_root = coco.use_context(CODEBASE_DIR)
+    ps = load_project_settings(project_root)
+
+    table = await sqlite.mount_table_target(
+        db=SQLITE_DB,
+        table_name="code_chunks_vec",
+        table_schema=await sqlite.TableSchema.from_class(
+            CodeChunk,
+            primary_key=["id"],
+        ),
+        virtual_table_def=Vec0TableDef(
+            partition_key_columns=["language"],
+            auxiliary_columns=["file_path", "content", "start_line", "end_line"],
+        ),
+    )
+
+    matcher = build_matcher(
+        project_root, ps.include_patterns, ps.exclude_patterns, ps.max_file_size
+    )
+
+    files = localfs.walk_dir(
+        CODEBASE_DIR,
+        recursive=True,
+        path_matcher=matcher,
+    )
+
+    language_overrides = {f".{lo.ext}": lo.lang for lo in ps.language_overrides}
+    await coco.mount_each(
+        coco.component_subpath(coco.Symbol("process_file")),
+        process_file,
+        files.items(),
+        table,
+        language_overrides,
+    )
